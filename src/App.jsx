@@ -5,11 +5,17 @@ const AUTH_KEY = 'paycheck-tracker:auth';
 
 const DEFAULT_STATE = {
   bufferVault: 600,
-  billsVault: 205,
   sofiBalance: 15260.68,
   rothYTD: 0,
   emergencyFund: 0,
   movingFund: 0,
+  reconciledAt: {
+    bufferVault: null,
+    sofiBalance: null,
+    emergencyFund: null,
+    movingFund: null,
+  },
+  lastSeenPhase: 1,
   settings: {
     bufferGoal: 1000,
     sofiAPR: 0.08,
@@ -17,7 +23,7 @@ const DEFAULT_STATE = {
     paychecksPerMonth: 2.17,
     defaultPaycheck: 2365,
     phase1BillsAmount: 850,
-    phase1BufferContribution: 500,
+    phase1BufferContribution: 400,
     phase2BillsAmount: 850,
     phase2SpendingAmount: 800,
     phase3BillsAmount: 600,
@@ -28,20 +34,76 @@ const DEFAULT_STATE = {
   history: [],
 };
 
+const DAY_MS = 1000 * 60 * 60 * 24;
+
 function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return DEFAULT_STATE;
     const parsed = JSON.parse(raw);
-    return {
+    const merged = {
       ...DEFAULT_STATE,
       ...parsed,
       settings: { ...DEFAULT_STATE.settings, ...(parsed.settings || {}) },
       history: parsed.history || [],
+      reconciledAt: { ...DEFAULT_STATE.reconciledAt, ...(parsed.reconciledAt || {}) },
     };
+    if (!parsed.reconciledAt) {
+      const now = Date.now();
+      merged.reconciledAt = {
+        bufferVault: now,
+        sofiBalance: now,
+        emergencyFund: now,
+        movingFund: now,
+      };
+    }
+    if (parsed.lastSeenPhase == null) {
+      merged.lastSeenPhase = determinePhase(merged);
+    }
+    if (parsed.settings && parsed.settings.phase1BufferContribution === 500) {
+      merged.settings.phase1BufferContribution = 400;
+    }
+    delete merged.billsVault;
+    return merged;
   } catch {
     return DEFAULT_STATE;
   }
+}
+
+function daysAgo(ts) {
+  if (!ts) return null;
+  return Math.floor((Date.now() - ts) / DAY_MS);
+}
+
+function reconciledLabel(ts) {
+  if (!ts) return 'never reconciled';
+  const d = daysAgo(ts);
+  if (d <= 0) return 'reconciled today';
+  if (d === 1) return 'reconciled 1 day ago';
+  return `reconciled ${d} days ago`;
+}
+
+function reconciledColor(ts) {
+  const d = daysAgo(ts);
+  if (d == null) return 'text-amber-400';
+  if (d > 30) return 'text-red-400';
+  if (d > 14) return 'text-amber-400';
+  return 'text-neutral-500';
+}
+
+function isDrifty(reconciledAt) {
+  return Object.values(reconciledAt).some(
+    (ts) => !ts || (Date.now() - ts) / DAY_MS > 30
+  );
+}
+
+function halfMonthInterestOn(balance, apr) {
+  return (balance * (apr / 12)) / 2;
+}
+
+function minPaymentPerPaycheck(sofiMin, paychecksPerMonth) {
+  if (!paychecksPerMonth) return 0;
+  return sofiMin / paychecksPerMonth;
 }
 
 const fmt = (n) =>
@@ -110,16 +172,42 @@ function computeAllocation(state, phase, paycheck, options = {}) {
   return { bills, roth, ef, movingFund, surplus: remaining };
 }
 
+const DRIFT_DISMISS_KEY = 'paycheck-tracker:drift-dismissed';
+
 export default function App() {
   const [state, setState] = useState(loadState);
   const [showLog, setShowLog] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showSync, setShowSync] = useState(false);
+  const [reconcileTarget, setReconcileTarget] = useState(null);
   const [password, setPassword] = useState(() => localStorage.getItem(AUTH_KEY) || '');
   const [syncStatus, setSyncStatus] = useState(password ? 'syncing' : 'local');
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
+  const [driftDismissed, setDriftDismissed] = useState(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    return localStorage.getItem(DRIFT_DISMISS_KEY) === today;
+  });
   const skipSaveRef = useRef(false);
   const saveTimerRef = useRef(null);
+
+  function dismissDrift() {
+    const today = new Date().toISOString().slice(0, 10);
+    localStorage.setItem(DRIFT_DISMISS_KEY, today);
+    setDriftDismissed(true);
+  }
+
+  function reconcileBalance(key, value) {
+    setState((prev) => ({
+      ...prev,
+      [key]: parseFloat(value) || 0,
+      reconciledAt: { ...prev.reconciledAt, [key]: Date.now() },
+    }));
+    setReconcileTarget(null);
+  }
+
+  function dismissPhaseTransition() {
+    setState((prev) => ({ ...prev, lastSeenPhase: determinePhase(prev) }));
+  }
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -267,22 +355,26 @@ export default function App() {
   function logPaycheck(entry) {
     setState((prev) => {
       const next = { ...prev };
-      const a = entry.allocation;
+      const a = { ...entry.allocation };
+      const ps = prev.settings;
       if (entry.phase === 1) {
-        next.bufferVault = Math.min(s.bufferGoal, prev.bufferVault + a.buffer);
-        next.billsVault = prev.billsVault + a.bills;
+        next.bufferVault = Math.min(ps.bufferGoal, prev.bufferVault + a.buffer);
       } else if (entry.phase === 2) {
-        next.billsVault = prev.billsVault + a.bills;
-        next.sofiBalance = Math.max(0, prev.sofiBalance - a.sofiExtra);
+        const interest = halfMonthInterestOn(prev.sofiBalance, ps.sofiAPR);
+        const minPay = minPaymentPerPaycheck(ps.sofiMin, ps.paychecksPerMonth);
+        a.interestAccrual = interest;
+        a.minPayment = minPay;
+        next.sofiBalance = Math.max(
+          0,
+          prev.sofiBalance + interest - a.sofiExtra - minPay
+        );
       } else {
-        next.billsVault = prev.billsVault + a.bills;
         next.rothYTD = prev.rothYTD + a.roth;
         next.emergencyFund = prev.emergencyFund + a.ef;
         next.movingFund = prev.movingFund + a.movingFund;
       }
       const balancesAfter = {
         bufferVault: next.bufferVault,
-        billsVault: next.billsVault,
         sofiBalance: next.sofiBalance,
         rothYTD: next.rothYTD,
         emergencyFund: next.emergencyFund,
@@ -331,7 +423,26 @@ export default function App() {
           </div>
         </header>
 
-        <BufferCard state={state} phase={phase} bufferPct={bufferPct} />
+        {phase > state.lastSeenPhase && (
+          <PhaseTransitionBanner newPhase={phase} onDismiss={dismissPhaseTransition} />
+        )}
+        {isDrifty(state.reconciledAt) && !driftDismissed && (
+          <DriftBanner onDismiss={dismissDrift} />
+        )}
+
+        <BufferCard
+          state={state}
+          phase={phase}
+          bufferPct={bufferPct}
+          onReconcile={() =>
+            setReconcileTarget({
+              key: 'bufferVault',
+              title: 'Reconcile Buffer Vault',
+              label: 'Current Buffer Vault balance',
+              currentValue: state.bufferVault,
+            })
+          }
+        />
 
         <SofiCard
           state={state}
@@ -339,9 +450,37 @@ export default function App() {
           sofiPct={sofiPct}
           sofiPaid={sofiPaid}
           projection={projection}
+          onReconcile={() =>
+            setReconcileTarget({
+              key: 'sofiBalance',
+              title: 'Reconcile SoFi loan',
+              label: 'Current SoFi loan balance',
+              currentValue: state.sofiBalance,
+            })
+          }
         />
 
-        {phase === 3 && <Phase3Cards state={state} />}
+        {phase === 3 && (
+          <Phase3Cards
+            state={state}
+            onReconcileEF={() =>
+              setReconcileTarget({
+                key: 'emergencyFund',
+                title: 'Reconcile Emergency Fund',
+                label: 'Current Emergency Fund balance',
+                currentValue: state.emergencyFund,
+              })
+            }
+            onReconcileMoving={() =>
+              setReconcileTarget({
+                key: 'movingFund',
+                title: 'Reconcile Moving Fund',
+                label: 'Current Moving Fund balance',
+                currentValue: state.movingFund,
+              })
+            }
+          />
+        )}
 
         <RothCard state={state} setState={setState} />
 
@@ -383,7 +522,123 @@ export default function App() {
           onClose={() => setShowSync(false)}
         />
       )}
+      {reconcileTarget && (
+        <ReconcileModal
+          {...reconcileTarget}
+          onSave={(v) => reconcileBalance(reconcileTarget.key, v)}
+          onClose={() => setReconcileTarget(null)}
+        />
+      )}
     </div>
+  );
+}
+
+function PhaseTransitionBanner({ newPhase, onDismiss }) {
+  const messages = {
+    2: {
+      title: 'Buffer goal reached',
+      body: "You're now in Phase 2 — SoFi attack mode. Every paycheck after bills + spending goes to the loan.",
+    },
+    3: {
+      title: 'SoFi loan paid off',
+      body: "You're now in Phase 3 — Roth, emergency fund, and moving fund.",
+    },
+  };
+  const m = messages[newPhase] || { title: `Phase ${newPhase}`, body: '' };
+  return (
+    <div className="mb-4 flex items-start gap-3 rounded-2xl border border-emerald-500/30 bg-gradient-to-br from-emerald-500/15 to-neutral-900 p-4">
+      <div className="text-2xl">🎯</div>
+      <div className="flex-1">
+        <div className="text-sm font-semibold text-emerald-300">{m.title}</div>
+        <div className="mt-0.5 text-xs text-neutral-400">{m.body}</div>
+      </div>
+      <button
+        onClick={onDismiss}
+        className="rounded-md px-2 py-1 text-xs text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+      >
+        ✕
+      </button>
+    </div>
+  );
+}
+
+function DriftBanner({ onDismiss }) {
+  return (
+    <div className="mb-4 flex items-start gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4">
+      <div className="text-xl">⚠️</div>
+      <div className="flex-1">
+        <div className="text-sm font-semibold text-amber-200">Balances may be out of sync</div>
+        <div className="mt-0.5 text-xs text-amber-100/70">
+          One or more balances haven't been reconciled in over 30 days. Open SoFi and tap reconcile
+          on each card to update.
+        </div>
+      </div>
+      <button
+        onClick={onDismiss}
+        className="rounded-md px-2 py-1 text-xs text-amber-300/70 hover:bg-amber-900/30 hover:text-amber-200"
+      >
+        Dismiss
+      </button>
+    </div>
+  );
+}
+
+function ReconcileButton({ onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className="rounded-md border border-neutral-700 bg-neutral-900/60 px-2 py-1 text-[11px] font-medium text-neutral-300 hover:border-emerald-500/40 hover:text-emerald-300"
+      aria-label="Reconcile balance"
+    >
+      Reconcile
+    </button>
+  );
+}
+
+function ReconciledLine({ ts }) {
+  return <div className={`mt-2 text-xs ${reconciledColor(ts)}`}>{reconciledLabel(ts)}</div>;
+}
+
+function ReconcileModal({ title, label, currentValue, onSave, onClose }) {
+  const [val, setVal] = useState(String(currentValue ?? 0));
+  return (
+    <Modal title={title} onClose={onClose}>
+      <p className="mb-4 text-sm text-neutral-400">
+        Open SoFi (or your bank), copy the actual current balance, paste here. Resets the drift
+        timer.
+      </p>
+      <label className="mb-4 block">
+        <span className="mb-1 block text-xs uppercase tracking-wider text-neutral-500">{label}</span>
+        <div className="relative">
+          <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500">
+            $
+          </span>
+          <input
+            type="number"
+            value={val}
+            onChange={(e) => setVal(e.target.value)}
+            inputMode="decimal"
+            step="0.01"
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-7 py-3 text-2xl font-semibold tabular-nums focus:border-emerald-500 focus:outline-none"
+            autoFocus
+          />
+        </div>
+      </label>
+      <div className="flex gap-2">
+        <button
+          onClick={onClose}
+          className="flex-1 rounded-lg border border-neutral-700 bg-neutral-900 px-4 py-2.5 text-sm hover:bg-neutral-800"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={() => onSave(val)}
+          className="flex-1 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-400"
+        >
+          Save
+        </button>
+      </div>
+    </Modal>
   );
 }
 
@@ -513,7 +768,7 @@ function SyncModal({ status, connected, lastSyncedAt, onConnect, onDisconnect, o
   );
 }
 
-function BufferCard({ state, phase, bufferPct }) {
+function BufferCard({ state, phase, bufferPct, onReconcile }) {
   const goal = state.settings.bufferGoal;
   const isPrimary = phase === 1;
   return (
@@ -524,9 +779,12 @@ function BufferCard({ state, phase, bufferPct }) {
           : 'border-neutral-800 bg-neutral-900'
       }`}
     >
-      <div className="mb-2 flex items-baseline justify-between">
+      <div className="mb-2 flex items-center justify-between">
         <h2 className="text-sm font-medium text-neutral-400">Buffer Vault</h2>
-        <span className="text-xs text-neutral-500">goal {fmt0(goal)}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-neutral-500">goal {fmt0(goal)}</span>
+          <ReconcileButton onClick={onReconcile} />
+        </div>
       </div>
       <div className="mb-3 flex items-baseline gap-2">
         <span className={`font-semibold tracking-tight ${isPrimary ? 'text-3xl' : 'text-2xl'}`}>
@@ -547,11 +805,12 @@ function BufferCard({ state, phase, bufferPct }) {
           style={{ width: `${bufferPct}%` }}
         />
       </div>
+      <ReconciledLine ts={state.reconciledAt?.bufferVault} />
     </section>
   );
 }
 
-function SofiCard({ state, phase, sofiPct, sofiPaid, projection }) {
+function SofiCard({ state, phase, sofiPct, sofiPaid, projection, onReconcile }) {
   const isPrimary = phase === 2;
   const monthsLabel =
     projection.neverPaysOff
@@ -570,9 +829,12 @@ function SofiCard({ state, phase, sofiPct, sofiPaid, projection }) {
           : 'border-neutral-800 bg-neutral-900'
       }`}
     >
-      <div className="mb-2 flex items-baseline justify-between">
+      <div className="mb-2 flex items-center justify-between">
         <h2 className="text-sm font-medium text-neutral-400">SoFi loan</h2>
-        <span className="text-xs text-neutral-500">{sofiPct.toFixed(1)}% paid</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-neutral-500">{sofiPct.toFixed(1)}% paid</span>
+          <ReconcileButton onClick={onReconcile} />
+        </div>
       </div>
       <div className="mb-3 flex items-baseline gap-2">
         <span className={`font-semibold tracking-tight ${isPrimary ? 'text-3xl' : 'text-2xl'}`}>
@@ -602,6 +864,7 @@ function SofiCard({ state, phase, sofiPct, sofiPaid, projection }) {
           {fmt0(expectedExtraPerPaycheck(state, phase))}/paycheck once buffer is full.
         </p>
       )}
+      <ReconciledLine ts={state.reconciledAt?.sofiBalance} />
     </section>
   );
 }
@@ -659,31 +922,39 @@ function RothCard({ state, setState }) {
   );
 }
 
-function Phase3Cards({ state }) {
+function Phase3Cards({ state, onReconcileEF, onReconcileMoving }) {
   const s = state.settings;
   const efPct = Math.min(100, (state.emergencyFund / s.phase3EFGoal) * 100);
   const fundPct = Math.min(100, (state.movingFund / s.phase3FundGoal) * 100);
   return (
     <>
       <section className="mb-4 rounded-2xl border border-neutral-800 bg-neutral-900 p-5">
-        <div className="mb-2 flex items-baseline justify-between">
+        <div className="mb-2 flex items-center justify-between">
           <h2 className="text-sm font-medium text-neutral-400">Emergency Fund</h2>
-          <span className="text-xs text-neutral-500">goal {fmt0(s.phase3EFGoal)}</span>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-neutral-500">goal {fmt0(s.phase3EFGoal)}</span>
+            <ReconcileButton onClick={onReconcileEF} />
+          </div>
         </div>
         <div className="mb-3 text-2xl font-semibold tracking-tight">{fmt(state.emergencyFund)}</div>
         <div className="h-2 overflow-hidden rounded-full bg-neutral-800">
           <div className="h-full rounded-full bg-sky-400" style={{ width: `${efPct}%` }} />
         </div>
+        <ReconciledLine ts={state.reconciledAt?.emergencyFund} />
       </section>
       <section className="mb-4 rounded-2xl border border-neutral-800 bg-neutral-900 p-5">
-        <div className="mb-2 flex items-baseline justify-between">
+        <div className="mb-2 flex items-center justify-between">
           <h2 className="text-sm font-medium text-neutral-400">Moving Fund</h2>
-          <span className="text-xs text-neutral-500">goal {fmt0(s.phase3FundGoal)}</span>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-neutral-500">goal {fmt0(s.phase3FundGoal)}</span>
+            <ReconcileButton onClick={onReconcileMoving} />
+          </div>
         </div>
         <div className="mb-3 text-2xl font-semibold tracking-tight">{fmt(state.movingFund)}</div>
         <div className="h-2 overflow-hidden rounded-full bg-neutral-800">
           <div className="h-full rounded-full bg-violet-400" style={{ width: `${fundPct}%` }} />
         </div>
+        <ReconciledLine ts={state.reconciledAt?.movingFund} />
       </section>
     </>
   );
@@ -691,13 +962,15 @@ function Phase3Cards({ state }) {
 
 function RulesCard({ state, phase }) {
   const s = state.settings;
+  const billsAmount =
+    phase === 1 ? s.phase1BillsAmount : phase === 2 ? s.phase2BillsAmount : s.phase3BillsAmount;
   return (
     <section className="mb-2 rounded-2xl border border-neutral-800 bg-neutral-900 p-5">
       <h2 className="mb-3 text-sm font-medium text-neutral-400">Allocation rules · Phase {phase}</h2>
       <ul className="space-y-1.5 text-sm">
+        <Rule label="Transfer → Bills Vault" value={fmt0(billsAmount)} />
         {phase === 1 && (
           <>
-            <Rule label="Bills Vault" value={fmt0(s.phase1BillsAmount)} />
             <Rule label="Buffer Vault" value={`${fmt0(s.phase1BufferContribution)} / paycheck`} />
             <Rule label="Spending" value="remainder" muted />
             <Rule label="Extra to SoFi" value={fmt0(0)} muted />
@@ -705,19 +978,20 @@ function RulesCard({ state, phase }) {
         )}
         {phase === 2 && (
           <>
-            <Rule label="Bills Vault" value={fmt0(s.phase2BillsAmount)} />
             <Rule label="Spending" value={fmt0(s.phase2SpendingAmount)} />
             <Rule label="Extra to SoFi" value="remainder" highlight />
           </>
         )}
         {phase === 3 && (
           <>
-            <Rule label="Bills Vault" value={fmt0(s.phase3BillsAmount)} />
             <Rule label="Roth IRA" value={fmt0(s.phase3RothAmount)} />
             <Rule label="Emergency → Moving" value="remainder" muted />
           </>
         )}
       </ul>
+      <p className="mt-3 text-xs text-neutral-600">
+        Bills Vault lives in SoFi — not tracked here. Just transfer the amount on payday.
+      </p>
     </section>
   );
 }
@@ -811,8 +1085,15 @@ function LogPaycheckModal({ state, phase, onClose, onConfirm }) {
   const paycheck = parseFloat(amount) || 0;
   const allocation = computeAllocation(state, phase, paycheck, { bufferContribution });
 
+  const interestAccrual = phase === 2 ? halfMonthInterestOn(state.sofiBalance, s.sofiAPR) : 0;
+  const minPayment = phase === 2 ? minPaymentPerPaycheck(s.sofiMin, s.paychecksPerMonth) : 0;
   const newSofi =
-    phase === 2 ? Math.max(0, state.sofiBalance - (allocation.sofiExtra || 0)) : state.sofiBalance;
+    phase === 2
+      ? Math.max(
+          0,
+          state.sofiBalance + interestAccrual - (allocation.sofiExtra || 0) - minPayment
+        )
+      : state.sofiBalance;
   const newProjection = useMemo(() => {
     if (phase !== 2) return null;
     const monthlyExtra = allocation.sofiExtra * s.paychecksPerMonth;
@@ -900,20 +1181,38 @@ function LogPaycheckModal({ state, phase, onClose, onConfirm }) {
 
       {phase === 2 && newProjection && (
         <div className="mb-4 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 text-sm">
-          <div className="text-xs uppercase tracking-wider text-emerald-400/80">After this</div>
-          <div className="mt-1 flex items-baseline justify-between">
-            <span className="text-neutral-400">SoFi balance</span>
-            <span className="font-semibold tabular-nums">{fmt(newSofi)}</span>
-          </div>
-          <div className="mt-1 flex items-baseline justify-between">
-            <span className="text-neutral-400">Payoff</span>
-            <span className="font-semibold tabular-nums">
-              {newProjection.neverPaysOff
-                ? '—'
-                : newProjection.date
-                  ? `${newProjection.date.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })} (${newProjection.months} mo)`
-                  : 'paid off'}
-            </span>
+          <div className="text-xs uppercase tracking-wider text-emerald-400/80">SoFi math</div>
+          <div className="mt-2 space-y-1">
+            <div className="flex items-baseline justify-between">
+              <span className="text-neutral-400">Current balance</span>
+              <span className="tabular-nums">{fmt(state.sofiBalance)}</span>
+            </div>
+            <div className="flex items-baseline justify-between">
+              <span className="text-neutral-400">+ Interest (½ month)</span>
+              <span className="tabular-nums text-amber-300">+{fmt(interestAccrual)}</span>
+            </div>
+            <div className="flex items-baseline justify-between">
+              <span className="text-neutral-400">− Minimum payment</span>
+              <span className="tabular-nums text-emerald-300">−{fmt(minPayment)}</span>
+            </div>
+            <div className="flex items-baseline justify-between">
+              <span className="text-neutral-400">− Extra principal</span>
+              <span className="tabular-nums text-emerald-300">−{fmt(allocation.sofiExtra)}</span>
+            </div>
+            <div className="mt-1 flex items-baseline justify-between border-t border-emerald-500/10 pt-2">
+              <span className="font-medium text-neutral-200">New balance</span>
+              <span className="font-semibold tabular-nums">{fmt(newSofi)}</span>
+            </div>
+            <div className="flex items-baseline justify-between">
+              <span className="text-neutral-400">Payoff</span>
+              <span className="font-semibold tabular-nums">
+                {newProjection.neverPaysOff
+                  ? '—'
+                  : newProjection.date
+                    ? `${newProjection.date.toLocaleDateString('en-US', { month: 'short', year: 'numeric' })} (${newProjection.months} mo)`
+                    : 'paid off'}
+              </span>
+            </div>
           </div>
         </div>
       )}
@@ -958,7 +1257,6 @@ function SettingsModal({ state, setState, onClose }) {
   const [draft, setDraft] = useState(() => ({
     ...state.settings,
     bufferVault: state.bufferVault,
-    billsVault: state.billsVault,
     sofiBalance: state.sofiBalance,
     emergencyFund: state.emergencyFund,
     movingFund: state.movingFund,
@@ -972,7 +1270,6 @@ function SettingsModal({ state, setState, onClose }) {
     setState((prev) => ({
       ...prev,
       bufferVault: parseFloat(draft.bufferVault) || 0,
-      billsVault: parseFloat(draft.billsVault) || 0,
       sofiBalance: parseFloat(draft.sofiBalance) || 0,
       emergencyFund: parseFloat(draft.emergencyFund) || 0,
       movingFund: parseFloat(draft.movingFund) || 0,
@@ -1005,7 +1302,6 @@ function SettingsModal({ state, setState, onClose }) {
     <Modal onClose={onClose} title="Settings">
       <Section title="Current balances">
         <Field label="Buffer Vault" k="bufferVault" v={draft.bufferVault} on={update} />
-        <Field label="Bills Vault" k="billsVault" v={draft.billsVault} on={update} />
         <Field label="SoFi balance" k="sofiBalance" v={draft.sofiBalance} on={update} />
         <Field label="Emergency Fund" k="emergencyFund" v={draft.emergencyFund} on={update} />
         <Field label="Moving Fund" k="movingFund" v={draft.movingFund} on={update} />
