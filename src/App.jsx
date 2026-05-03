@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 const STORAGE_KEY = 'paycheck-tracker:v1';
+const AUTH_KEY = 'paycheck-tracker:auth';
 
 const DEFAULT_STATE = {
   bufferVault: 600,
@@ -113,10 +114,143 @@ export default function App() {
   const [state, setState] = useState(loadState);
   const [showLog, setShowLog] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showSync, setShowSync] = useState(false);
+  const [password, setPassword] = useState(() => localStorage.getItem(AUTH_KEY) || '');
+  const [syncStatus, setSyncStatus] = useState(password ? 'syncing' : 'local');
+  const [lastSyncedAt, setLastSyncedAt] = useState(null);
+  const skipSaveRef = useRef(false);
+  const saveTimerRef = useRef(null);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   }, [state]);
+
+  useEffect(() => {
+    if (!password) {
+      setSyncStatus('local');
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      setSyncStatus('syncing');
+      try {
+        const res = await fetch('/api/state', { headers: { 'x-auth': password } });
+        if (cancelled) return;
+        if (res.status === 401) {
+          localStorage.removeItem(AUTH_KEY);
+          setPassword('');
+          setSyncStatus('unauth');
+          return;
+        }
+        if (res.status === 204) {
+          setSyncStatus('synced');
+          setLastSyncedAt(Date.now());
+          return;
+        }
+        if (!res.ok) {
+          setSyncStatus('error');
+          return;
+        }
+        const data = await res.json();
+        skipSaveRef.current = true;
+        const { _updatedAt, ...clean } = data;
+        setState({
+          ...DEFAULT_STATE,
+          ...clean,
+          settings: { ...DEFAULT_STATE.settings, ...(clean.settings || {}) },
+          history: clean.history || [],
+        });
+        setLastSyncedAt(_updatedAt || Date.now());
+        setSyncStatus('synced');
+        setTimeout(() => {
+          skipSaveRef.current = false;
+        }, 0);
+      } catch {
+        if (!cancelled) setSyncStatus('offline');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [password]);
+
+  useEffect(() => {
+    if (skipSaveRef.current || !password) return;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    setSyncStatus('syncing');
+    saveTimerRef.current = setTimeout(async () => {
+      try {
+        const res = await fetch('/api/state', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'x-auth': password },
+          body: JSON.stringify(state),
+        });
+        if (res.status === 401) {
+          localStorage.removeItem(AUTH_KEY);
+          setPassword('');
+          setSyncStatus('unauth');
+          return;
+        }
+        if (!res.ok) {
+          setSyncStatus('error');
+          return;
+        }
+        const data = await res.json().catch(() => ({}));
+        setLastSyncedAt(data.updatedAt || Date.now());
+        setSyncStatus('synced');
+      } catch {
+        setSyncStatus('offline');
+      }
+    }, 800);
+  }, [state, password]);
+
+  function connectSync(pw) {
+    localStorage.setItem(AUTH_KEY, pw);
+    setPassword(pw);
+  }
+
+  function disconnectSync() {
+    localStorage.removeItem(AUTH_KEY);
+    setPassword('');
+    setSyncStatus('local');
+  }
+
+  async function refreshFromServer() {
+    if (!password) return;
+    setSyncStatus('syncing');
+    try {
+      const res = await fetch('/api/state', { headers: { 'x-auth': password } });
+      if (res.status === 401) {
+        disconnectSync();
+        setSyncStatus('unauth');
+        return;
+      }
+      if (res.status === 204) {
+        setSyncStatus('synced');
+        return;
+      }
+      if (!res.ok) {
+        setSyncStatus('error');
+        return;
+      }
+      const data = await res.json();
+      const { _updatedAt, ...clean } = data;
+      skipSaveRef.current = true;
+      setState({
+        ...DEFAULT_STATE,
+        ...clean,
+        settings: { ...DEFAULT_STATE.settings, ...(clean.settings || {}) },
+        history: clean.history || [],
+      });
+      setLastSyncedAt(_updatedAt || Date.now());
+      setSyncStatus('synced');
+      setTimeout(() => {
+        skipSaveRef.current = false;
+      }, 0);
+    } catch {
+      setSyncStatus('offline');
+    }
+  }
 
   const phase = determinePhase(state);
   const s = state.settings;
@@ -178,7 +312,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100">
       <div className="mx-auto max-w-2xl px-4 pt-6 pb-24 sm:pt-10">
-        <header className="mb-6 flex items-center justify-between">
+        <header className="mb-6 flex items-center justify-between gap-2">
           <div>
             <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">Paycheck Tracker</h1>
             <p className="text-xs text-neutral-500">
@@ -186,12 +320,15 @@ export default function App() {
               {phase === 1 ? 'Buffer-building' : phase === 2 ? 'SoFi attack' : 'Post-SoFi'}
             </p>
           </div>
-          <button
-            onClick={() => setShowSettings(true)}
-            className="rounded-md border border-neutral-800 bg-neutral-900 px-3 py-1.5 text-xs text-neutral-300 hover:bg-neutral-800"
-          >
-            Settings
-          </button>
+          <div className="flex items-center gap-2">
+            <SyncBadge status={syncStatus} onClick={() => setShowSync(true)} />
+            <button
+              onClick={() => setShowSettings(true)}
+              className="rounded-md border border-neutral-800 bg-neutral-900 px-3 py-1.5 text-xs text-neutral-300 hover:bg-neutral-800"
+            >
+              Settings
+            </button>
+          </div>
         </header>
 
         <BufferCard state={state} phase={phase} bufferPct={bufferPct} />
@@ -235,7 +372,144 @@ export default function App() {
           onClose={() => setShowSettings(false)}
         />
       )}
+      {showSync && (
+        <SyncModal
+          status={syncStatus}
+          connected={!!password}
+          lastSyncedAt={lastSyncedAt}
+          onConnect={connectSync}
+          onDisconnect={disconnectSync}
+          onRefresh={refreshFromServer}
+          onClose={() => setShowSync(false)}
+        />
+      )}
     </div>
+  );
+}
+
+function SyncBadge({ status, onClick }) {
+  const map = {
+    local: { label: 'Local only', cls: 'border-neutral-700 bg-neutral-900 text-neutral-400', dot: 'bg-neutral-500' },
+    syncing: { label: 'Syncing', cls: 'border-amber-500/30 bg-amber-500/10 text-amber-300', dot: 'bg-amber-400 animate-pulse' },
+    synced: { label: 'Synced', cls: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300', dot: 'bg-emerald-400' },
+    offline: { label: 'Offline', cls: 'border-orange-500/30 bg-orange-500/10 text-orange-300', dot: 'bg-orange-400' },
+    unauth: { label: 'Auth error', cls: 'border-red-500/30 bg-red-500/10 text-red-300', dot: 'bg-red-400' },
+    error: { label: 'Sync error', cls: 'border-red-500/30 bg-red-500/10 text-red-300', dot: 'bg-red-400' },
+  };
+  const s = map[status] || map.local;
+  return (
+    <button
+      onClick={onClick}
+      className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs ${s.cls}`}
+    >
+      <span className={`h-1.5 w-1.5 rounded-full ${s.dot}`} />
+      {s.label}
+    </button>
+  );
+}
+
+function SyncModal({ status, connected, lastSyncedAt, onConnect, onDisconnect, onRefresh, onClose }) {
+  const [pw, setPw] = useState('');
+  const [error, setError] = useState('');
+
+  async function tryConnect() {
+    setError('');
+    if (!pw) return;
+    try {
+      const res = await fetch('/api/state', { headers: { 'x-auth': pw } });
+      if (res.status === 401) {
+        setError('Wrong password.');
+        return;
+      }
+      if (res.status === 404) {
+        setError('No backend deployed at /api/state.');
+        return;
+      }
+      if (!res.ok && res.status !== 204) {
+        setError(`Server returned ${res.status}.`);
+        return;
+      }
+      onConnect(pw);
+      onClose();
+    } catch {
+      setError('Network error — backend unreachable.');
+    }
+  }
+
+  return (
+    <Modal title="Sync" onClose={onClose}>
+      {connected ? (
+        <div className="space-y-4">
+          <div className="rounded-xl border border-neutral-800 bg-neutral-950 p-4 text-sm">
+            <div className="flex items-center justify-between">
+              <span className="text-neutral-400">Status</span>
+              <span className="font-medium capitalize">{status}</span>
+            </div>
+            <div className="mt-1 flex items-center justify-between">
+              <span className="text-neutral-400">Last synced</span>
+              <span className="font-medium tabular-nums">
+                {lastSyncedAt ? new Date(lastSyncedAt).toLocaleString() : '—'}
+              </span>
+            </div>
+          </div>
+          <p className="text-xs text-neutral-500">
+            Changes auto-sync ~1 second after you make them. Pull latest if you edited on another
+            device.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={onRefresh}
+              className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-950 hover:bg-emerald-400"
+            >
+              Pull latest
+            </button>
+            <button
+              onClick={() => {
+                if (confirm('Disconnect this device from sync? Local data stays.')) {
+                  onDisconnect();
+                  onClose();
+                }
+              }}
+              className="rounded-lg border border-red-900/50 bg-red-900/20 px-4 py-2 text-sm text-red-400 hover:bg-red-900/40"
+            >
+              Disconnect
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <p className="text-sm text-neutral-400">
+            Enter the sync password to load and save state to the cloud. Same password on every
+            device gets you the same data.
+          </p>
+          <input
+            type="password"
+            value={pw}
+            onChange={(e) => setPw(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && tryConnect()}
+            placeholder="sync password"
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2.5 text-sm focus:border-emerald-500 focus:outline-none"
+            autoFocus
+          />
+          {error && <p className="text-xs text-red-400">{error}</p>}
+          <div className="flex gap-2">
+            <button
+              onClick={onClose}
+              className="flex-1 rounded-lg border border-neutral-700 bg-neutral-900 px-4 py-2.5 text-sm hover:bg-neutral-800"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={tryConnect}
+              disabled={!pw}
+              className="flex-1 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
+            >
+              Connect
+            </button>
+          </div>
+        </div>
+      )}
+    </Modal>
   );
 }
 

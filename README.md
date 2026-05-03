@@ -11,14 +11,27 @@ npm run dev
 
 Open http://localhost:5173. State is persisted to `localStorage`, so refreshing won't lose anything. Same browser = same data.
 
-## Deploy to Vercel
+## Deploy to Vercel + cloud sync
 
-```bash
-npm i -g vercel
-vercel
-```
+There's an optional tiny backend (`api/state.js`) that stores your state JSON in Upstash Redis behind a password, so any device with the password sees the same data.
 
-Or push to GitHub and import the repo in the Vercel dashboard. Framework preset auto-detects as Vite. No env vars, no backend.
+1. **Create an Upstash Redis database** — sign up at upstash.com (free tier), create a Redis DB, copy the `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
+2. **Push this repo to GitHub**, then in the Vercel dashboard → New Project → import it. Framework preset auto-detects as Vite.
+3. **Set env vars** in Vercel project settings → Environment Variables:
+   - `UPSTASH_REDIS_REST_URL` — from Upstash
+   - `UPSTASH_REDIS_REST_TOKEN` — from Upstash
+   - `STATE_PASSWORD` — any string you'll remember; this gates the API
+4. **Deploy.** Visit your URL on any device, click the **Local only** badge in the top-right, enter your `STATE_PASSWORD`, click **Connect**. From then on, that device syncs.
+
+Shortcut: instead of Upstash directly, you can also add the Upstash integration via the Vercel marketplace — it auto-injects the two `UPSTASH_*` env vars. You still set `STATE_PASSWORD` yourself.
+
+### How sync behaves
+
+- Every state change auto-saves to the server ~1 second after you stop changing things.
+- On app load, the server's copy hydrates the UI (server wins over local cache).
+- If the network drops, the badge flips to **Offline** and the app keeps working from localStorage. It'll re-sync on the next change once back online.
+- The Sync menu has **Pull latest** if you suspect another device has fresher data, and **Disconnect** to revert a device to local-only.
+- No password set = local-only mode (state stays in that browser's localStorage, no API calls). Safe default.
 
 ## How it works
 
